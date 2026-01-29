@@ -377,26 +377,39 @@ func (m Model) renderDashboard(height int) string {
 	// Stats cards
 	stats := m.detector.GetStats()
 
-	// Create stat cards
-	cards := []string{
-		m.renderStatCard("📦 Packets", fmt.Sprintf("%v", stats["totalPackets"]), secondaryColor),
-		m.renderStatCard("🖥️ Devices", fmt.Sprintf("%v", stats["devicesDetected"]), infoColor),
-		m.renderStatCard("🔴 Loops", fmt.Sprintf("%v", stats["loopsDetected"]), m.getLoopColor()),
-		m.renderStatCard("🔥 Storms", fmt.Sprintf("%v", stats["broadcastStorms"]), accentColor),
-		m.renderStatCard("🔀 Dup MACs", fmt.Sprintf("%v", stats["duplicateMACs"]), mediumColor),
-		m.renderStatCard("📡 TCN Count", fmt.Sprintf("%v", stats["tcnCount"]), primaryColor),
+	// Calculate widths for side-by-side layout
+	statsWidth := (m.width * 2) / 3
+	alertsWidth := m.width - statsWidth - 4
+
+	// Card width for 2-column grid within stats section
+	cardWidth := (statsWidth - 6) / 2
+	if cardWidth < 18 {
+		cardWidth = 18
+	}
+	if cardWidth > 28 {
+		cardWidth = 28
 	}
 
-	// Arrange cards in a grid
-	row1 := lipgloss.JoinHorizontal(lipgloss.Top, cards[0], " ", cards[1], " ", cards[2])
-	row2 := lipgloss.JoinHorizontal(lipgloss.Top, cards[3], " ", cards[4], " ", cards[5])
+	// Create stat cards with icons
+	packetsCard := m.renderStatCardSized("Packets", fmt.Sprintf("%v", stats["totalPackets"]), "📦", cyan, cardWidth)
+	devicesCard := m.renderStatCardSized("Devices", fmt.Sprintf("%v", stats["devicesDetected"]), "🖥️", green, cardWidth)
+	loopsCard := m.renderStatCardSized("Loops", fmt.Sprintf("%v", stats["loopsDetected"]), "🔴", m.getLoopColor(), cardWidth)
+	dupMACsCard := m.renderStatCardSized("Dup MACs", fmt.Sprintf("%v", stats["duplicateMACs"]), "🔀", yellow, cardWidth)
+	stormsCard := m.renderStatCardSized("Storms", fmt.Sprintf("%v", stats["broadcastStorms"]), "⚡", orange, cardWidth)
+	tcnCard := m.renderStatCardSized("TCN Count", fmt.Sprintf("%v", stats["tcnCount"]), "🔗", purple, cardWidth)
 
-	content := lipgloss.JoinVertical(lipgloss.Left, row1, "", row2)
+	// Arrange cards in 3 rows, 2 columns
+	row1 := lipgloss.JoinHorizontal(lipgloss.Top, packetsCard, " ", devicesCard)
+	row2 := lipgloss.JoinHorizontal(lipgloss.Top, loopsCard, " ", dupMACsCard)
+	row3 := lipgloss.JoinHorizontal(lipgloss.Top, stormsCard, " ", tcnCard)
 
-	// Add recent alerts section
-	if len(m.loops) > 0 {
-		content = lipgloss.JoinVertical(lipgloss.Left, content, "", m.renderRecentAlerts())
-	}
+	statsSection := lipgloss.JoinVertical(lipgloss.Left, row1, "", row2, "", row3)
+
+	// Recent Alerts panel on the right
+	alertsPanel := m.renderAlertsPanel(alertsWidth, height-4)
+
+	// Join stats and alerts side by side
+	content := lipgloss.JoinHorizontal(lipgloss.Top, statsSection, "  ", alertsPanel)
 
 	return content
 }
@@ -404,7 +417,7 @@ func (m Model) renderDashboard(height int) string {
 func (m Model) renderWelcome() string {
 	welcome := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(primaryColor).
+		BorderForeground(blue).
 		Padding(2, 4).
 		Width(60).
 		Align(lipgloss.Center).
@@ -418,57 +431,111 @@ func (m Model) renderWelcome() string {
 	return lipgloss.Place(m.width-4, 15, lipgloss.Center, lipgloss.Center, welcome)
 }
 
-func (m Model) renderStatCard(title string, value string, color lipgloss.Color) string {
-	cardWidth := (m.width - 10) / 3
-	if cardWidth < 20 {
-		cardWidth = 20
-	}
-	if cardWidth > 30 {
-		cardWidth = 30
-	}
+func (m Model) renderStatCardSized(title string, value string, icon string, color lipgloss.Color, width int) string {
+	// Icon and title on same line
+	titleLine := lipgloss.NewStyle().Foreground(fgMuted).Render(title) +
+		"  " +
+		lipgloss.NewStyle().Foreground(fgDark).Render(icon)
 
-	titleStyled := lipgloss.NewStyle().Foreground(fgMuted).Render(title)
-	valueStyled := lipgloss.NewStyle().
+	// Large value below
+	valueLine := lipgloss.NewStyle().
 		Foreground(color).
 		Bold(true).
-		MarginTop(1).
 		Render(value)
 
-	card := lipgloss.JoinVertical(lipgloss.Center, titleStyled, valueStyled)
+	card := lipgloss.JoinVertical(lipgloss.Left, titleLine, "", valueLine)
 
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(fgDark).
-		Width(cardWidth).
+		Width(width).
+		Height(5).
 		Padding(1, 2).
-		Align(lipgloss.Center).
 		Render(card)
 }
 
-func (m Model) renderRecentAlerts() string {
-	var alerts []string
-	alerts = append(alerts, headerStyle.Render("⚠️ Recent Alerts"))
+func (m Model) renderStatCard(title string, value string, color lipgloss.Color) string {
+	return m.renderStatCardSized(title, value, "", color, 24)
+}
 
-	for i, loop := range m.loops {
-		if i >= 5 {
-			break
+func (m Model) renderAlertsPanel(width int, height int) string {
+	headerText := lipgloss.NewStyle().
+		Foreground(fgBright).
+		Bold(true).
+		Render("Recent Alerts")
+
+	var alertLines []string
+	alertLines = append(alertLines, headerText)
+	alertLines = append(alertLines, "")
+
+	if len(m.loops) == 0 && len(m.storms) == 0 && len(m.dupMACs) == 0 {
+		alertLines = append(alertLines, mutedStyle.Render("No alerts yet"))
+	} else {
+		// Add loop alerts
+		for i, loop := range m.loops {
+			if i >= 4 {
+				break
+			}
+			severity := m.renderSeverityBadge(loop.Severity)
+			details := fmt.Sprintf("%s (%s)",
+				truncate(loop.VendorName, 20),
+				truncate(loop.DeviceName, 12),
+			)
+			timestamp := loop.DetectedTime.Format("15:04:05")
+
+			alertLines = append(alertLines, severity+": "+details)
+			alertLines = append(alertLines, mutedStyle.Render(timestamp))
+			alertLines = append(alertLines, "")
 		}
-		severity := m.renderSeverity(loop.Severity)
-		alert := fmt.Sprintf("%s %s (%s) on %s",
-			severity,
-			loop.MACAddress.String(),
-			truncate(loop.VendorName, 12),
-			truncate(loop.DeviceName, 15),
-		)
-		alerts = append(alerts, alert)
+
+		// Add storm alerts
+		for _, storm := range m.storms {
+			if storm.IsActive {
+				alertLines = append(alertLines, criticalStyle.Render("CRITICAL")+": Broadcast")
+				alertLines = append(alertLines, fmt.Sprintf("Storm Detected (%s)", truncate(storm.InterfaceName, 10)))
+				alertLines = append(alertLines, mutedStyle.Render(storm.DetectedTime.Format("15:04:05")))
+				alertLines = append(alertLines, "")
+			}
+		}
+
+		// Add duplicate MAC alerts
+		for _, dup := range m.dupMACs {
+			alertLines = append(alertLines, mediumStyle.Render("WARNING")+": Duplicate MAC")
+			alertLines = append(alertLines, "Address Found (MAC")
+			alertLines = append(alertLines, truncate(dup.MACAddress.String(), 17)+")")
+			alertLines = append(alertLines, mutedStyle.Render(dup.FirstSeen.Format("15:04:05")))
+			alertLines = append(alertLines, "")
+		}
 	}
+
+	content := strings.Join(alertLines, "\n")
 
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(highColor).
+		BorderForeground(orange).
+		Width(width).
+		Height(height).
 		Padding(1, 2).
-		Width(m.width - 4).
-		Render(strings.Join(alerts, "\n"))
+		Render(content)
+}
+
+func (m Model) renderSeverityBadge(severity detector.LoopSeverity) string {
+	switch severity {
+	case detector.SeverityCritical:
+		return criticalStyle.Render("CRITICAL")
+	case detector.SeverityHigh:
+		return highStyle.Render("HIGH")
+	case detector.SeverityMedium:
+		return mediumStyle.Render("WARNING")
+	case detector.SeverityLow:
+		return lowStyle.Render("INFO")
+	default:
+		return mutedStyle.Render("UNKNOWN")
+	}
+}
+
+func (m Model) renderRecentAlerts() string {
+	return m.renderAlertsPanel(m.width-4, 10)
 }
 
 func (m Model) renderLoopsTab(height int) string {
