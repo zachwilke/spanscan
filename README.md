@@ -1,17 +1,42 @@
 # SpanScan
 
-A terminal application for detecting network loops and STP (Spanning Tree Protocol) issues on your network.
+A terminal application for detecting network loops and STP (Spanning Tree Protocol) issues on your Layer 2 network.
 
 ## Features
 
-- Monitors all network interfaces for potential loops
-- Detects STP (Spanning Tree Protocol) issues
-- Identifies the MAC address and network location of loop sources
-- Shows vendor information for detected devices
-- Tracks all devices seen on the network
-- Clearly highlights which devices are causing network loops
-- Simple terminal UI with real-time updates
-- Starts in passive mode without active monitoring until explicitly enabled
+- **Multi-Algorithm Loop Detection**:
+  - Packet rate threshold detection
+  - MAC address duplication across interfaces (strong loop indicator)
+  - Broadcast storm detection
+  - STP/BPDU analysis with topology change tracking
+  
+- **STP Topology Awareness**:
+  - Full BPDU packet parsing (Configuration, TCN, RSTP)
+  - Root bridge detection and multiple-root warnings
+  - Topology change notification tracking
+  - BPDU rate monitoring
+
+- **Smart Loop Origin Analysis**:
+  - Confidence scoring for detected loops
+  - Evidence-based severity classification (Critical/High/Medium/Low)
+  - Suggested remediation actions
+  - Vendor-aware recommendations
+
+- **Device Intelligence**:
+  - MAC vendor identification (150+ vendors in local database)
+  - Device type classification (Switch, Router, AP, Firewall, IoT)
+  - Online MAC lookup fallback
+
+- **Configurable Thresholds**:
+  - Packet count threshold
+  - Broadcast storm threshold
+  - Sampling period
+  - Custom BPF filters
+
+- **Logging & Export**:
+  - JSON lines log output
+  - Event export to file
+  - Session summaries
 
 ## Requirements
 
@@ -20,136 +45,177 @@ A terminal application for detecting network loops and STP (Spanning Tree Protoc
 - libpcap development files (on Linux/macOS)
 - Npcap or WinPcap (on Windows)
 
-## Dependencies
-
-### Windows Packet Capture (Npcap/WinPcap)
-
-SpanScan requires a packet capture driver to be installed on your Windows system. This is a limitation that cannot be avoided, as Windows does not include native packet capture capabilities.
-
-#### Why can't Npcap be included with SpanScan?
-
-- **Licensing restrictions**: Npcap is developed by the Nmap Project and has specific licensing terms that generally don't allow for redistribution in most applications.
-- **System-level drivers**: Npcap installs kernel-level drivers that require proper Windows installation procedures.
-- **Administrative privileges**: Driver installation requires elevated privileges and Windows driver installation framework.
-
-#### Installation Options
-
-1. **Npcap** (Recommended): 
-   - Download from [https://nmap.org/npcap/](https://nmap.org/npcap/)
-   - Free for personal and non-commercial use
-   - Better performance and compatibility with modern Windows versions
-   - Supports raw 802.11 Wi-Fi packet capture
-
-2. **WinPcap**:
-   - Legacy alternative, no longer actively maintained
-   - Download from [https://www.winpcap.org/](https://www.winpcap.org/)
-   - Compatible with older Windows versions
-
-#### Installation Notes
-
-- During Npcap installation, select "Install Npcap in WinPcap API-compatible Mode" for best compatibility with SpanScan
-- You may need to restart your computer after installing Npcap/WinPcap
-- SpanScan must be run with administrative privileges even after driver installation
-
 ## Installation
 
 ### Install dependencies
 
 #### Windows
-1. Download and install [Npcap](https://nmap.org/npcap/) or [WinPcap](https://www.winpcap.org/) as described above
+1. Download and install [Npcap](https://nmap.org/npcap/) or [WinPcap](https://www.winpcap.org/)
 
 #### Linux
-```
+```bash
 sudo apt-get install libpcap-dev
 ```
 
 #### macOS
-```
+```bash
 brew install libpcap
 ```
 
-### Install SpanScan
+### Build SpanScan
 
-```
+```bash
 git clone https://github.com/yourusername/spanscan.git
 cd spanscan
-go build
+go build -o spanscan
 ```
 
 ## Usage
 
 Run with administrative privileges:
 
-### Windows
-Run as Administrator:
-```
+### Basic Usage
+```bash
+# Linux/macOS
+sudo ./spanscan
+
+# Windows (Run as Administrator)
 spanscan.exe
 ```
 
-### Linux/macOS
-```
-sudo ./spanscan
+### Advanced Options
+
+```bash
+# Custom detection thresholds
+sudo ./spanscan --threshold=50 --sample-time=5
+
+# Enable logging
+sudo ./spanscan --log=events.json --json
+
+# Lower broadcast storm threshold for sensitive detection
+sudo ./spanscan --broadcast-threshold=200
+
+# Custom BPF filter (STP only)
+sudo ./spanscan --filter='ether dst 01:80:c2:00:00:00'
+
+# Disable terminal bell alerts
+sudo ./spanscan --no-bell
 ```
 
-When SpanScan starts, it will display instructions and wait for your command. No network monitoring will occur until you explicitly start it by pressing 's'.
+### Command Line Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--threshold` | Packet count threshold for loop detection | 100 |
+| `--sample-time` | Sampling period in seconds | 10 |
+| `--broadcast-threshold` | Broadcast packets/sec for storm detection | 500 |
+| `--filter` | Custom BPF filter | (capture all) |
+| `--log` | Path to log file | (no logging) |
+| `--json` | Output log in JSON format | false |
+| `--config` | Path to JSON config file | - |
+| `--no-bell` | Disable terminal bell for alerts | false |
 
 ## Interactive Commands
 
-While the application is running, you can use the following commands:
-
-- `s` - Start network monitoring
-- `p` - Pause network monitoring
-- `q` - Quit the application
-- `h` - Display help
-- `r` - Refresh all displays
-- `d` - Show network devices with vendor information
-- `i` - Show monitored interfaces
-- `l` - Show detected loops
+| Key | Description |
+|-----|-------------|
+| `s` | Start network monitoring |
+| `p` | Pause network monitoring |
+| `q` | Quit the application |
+| `r` | Refresh display (status + loops + devices) |
+| `l` | Show detected loops |
+| `d` | Show network devices |
+| `i` | Show monitored interfaces |
+| `b` | Show broadcast storms |
+| `m` | Show duplicate MAC addresses |
+| `t` | Show STP topology info |
+| `a` | Show loop origin analysis |
+| `e` | Export events to JSON file |
+| `h` | Display help |
 
 ## How It Works
 
-SpanScan captures network packets on all interfaces and analyzes them for patterns that indicate network loops or STP issues. It specifically looks for:
+SpanScan uses multiple detection methods to identify network loops:
 
-1. BPDU (Bridge Protocol Data Units) packets - used by STP
-2. Unusually high rates of identical packets - indicates a potential loop
-3. Packets with specific destination addresses used in STP (01:80:c2:00:00:00)
+### 1. Packet Rate Analysis
+Monitors packet counts per source MAC per interface. When a MAC exceeds the threshold within the sampling period, it's flagged as a potential loop source.
 
-When a loop is detected, SpanScan identifies:
-- Source MAC address (the device causing the loop)
-- Vendor information (Cisco, Juniper, HP/Aruba, etc.)
-- Interface where the loop was detected
-- Time of detection
-- Number of looped packets observed
+### 2. MAC Duplication Detection
+Tracks when the same source MAC appears on multiple interfaces within a short time window (default: 2 seconds). This is a strong indicator of a loop.
 
-### Device Tracking
+### 3. Broadcast Storm Detection  
+Monitors broadcast traffic rates. When broadcast packets/second exceed the threshold, it indicates an active storm likely caused by a loop.
 
-SpanScan monitors all network devices visible to your interfaces, providing:
-- MAC address
-- Vendor identification
-- First and last seen times
-- Packet counts
-- Which interfaces the device was seen on
-- Clear indication when a device is a loop source
+### 4. STP/BPDU Analysis
+Parses STP packets to detect:
+- Topology Change Notifications (frequent = unstable network)
+- Multiple root bridges (STP misconfiguration)
+- Abnormal BPDU rates
 
-This helps network administrators quickly pinpoint the exact source of network issues.
+### Severity Classification
 
-## Workflow
+| Severity | Indicators |
+|----------|------------|
+| **CRITICAL** | Active broadcast storm |
+| **HIGH** | MAC on 2+ interfaces OR very high packet rate |
+| **MEDIUM** | Threshold exceeded OR frequent topology changes |
+| **LOW** | Elevated packet counts, monitoring recommended |
 
-1. Start SpanScan with appropriate privileges
-2. Review the available interfaces with the `i` command
-3. Press `s` to start monitoring
-4. Use `d` to see detected devices and their vendor information
-5. If loops are detected, use `l` to view detailed information
-6. Pause monitoring with `p` when needed
-7. Resume monitoring with `s` at any time
+## Configuration File
+
+Create a JSON configuration file:
+
+```json
+{
+  "packetCountThreshold": 100,
+  "broadcastStormThreshold": 500,
+  "samplingPeriodSec": 10,
+  "duplicateMACWindowSec": 2,
+  "bpfFilter": "",
+  "logFile": "spanscan.log",
+  "jsonOutput": true,
+  "enableBell": true
+}
+```
+
+Load with: `sudo ./spanscan --config=config.json`
+
+## Log Format
+
+When JSON logging is enabled, events are written in JSON Lines format:
+
+```json
+{"timestamp":"2024-01-15T10:30:00Z","eventType":"loop_detected","severity":3,"message":"Loop detected from AA:BB:CC:DD:EE:FF (Cisco)","details":{"macAddress":"AA:BB:CC:DD:EE:FF","vendorName":"Cisco","interfaceName":"eth0","packetCount":250,"confidenceScore":0.85,"evidence":["High packet rate: 250 packets","MAC on 2 interfaces"]}}
+```
 
 ## Troubleshooting
 
-- **Error: "No interfaces found"**: Verify that Npcap/WinPcap is properly installed and that you're running SpanScan as Administrator
-- **Error: "Unable to open device"**: Make sure you have administrative privileges and that the network interface exists
-- **No packets captured**: Some virtualized environments or network configurations might restrict packet capturing; try on a physical network interface
-- **No vendor information**: If vendor lookups fail, a local database of common network equipment vendors is still used
+| Error | Solution |
+|-------|----------|
+| "No interfaces found" | Install Npcap/WinPcap and run as Administrator |
+| "Unable to open device" | Check administrative privileges |
+| No packets captured | Try physical interface, check virtualization settings |
+| No vendor information | Online lookup may be rate-limited; local DB has 150+ vendors |
+
+## Project Structure
+
+```
+spanscan/
+├── main.go           # CLI and main event loop
+├── config/
+│   └── config.go     # Configuration management
+├── detector/
+│   └── detector.go   # Core loop detection engine
+├── stp/
+│   └── parser.go     # STP/BPDU packet parser
+├── macvendor/
+│   └── lookup.go     # MAC vendor lookup service
+├── logging/
+│   └── logger.go     # Structured event logging
+└── ui/
+    └── terminal.go   # Terminal user interface
+```
 
 ## License
 
-MIT 
+MIT

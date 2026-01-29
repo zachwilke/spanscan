@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,11 +12,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spanscan/config"
 	"github.com/spanscan/detector"
 	"github.com/spanscan/ui"
 )
 
 func main() {
+	// Parse command line flags
+	cfg := parseFlags()
+
 	fmt.Println("SpanScan - Network Loop & STP Issue Detector")
 	fmt.Println("--------------------------------------------")
 
@@ -24,8 +29,8 @@ func main() {
 		checkWindowsAdminRights()
 	}
 
-	// Initialize detector
-	d, err := detector.New()
+	// Initialize detector with configuration
+	d, err := detector.NewWithConfig(cfg)
 	if err != nil {
 		handleInitializationError(err)
 		return
@@ -48,7 +53,7 @@ func main() {
 	go readInput(inputChan)
 
 	// Display welcome message and instructions
-	displayWelcomeMessage()
+	displayWelcomeMessage(cfg)
 
 	// Main event loop
 	running := true
@@ -120,6 +125,32 @@ func main() {
 				} else {
 					fmt.Println("\nNo loops detected. Press 's' to start monitoring.")
 				}
+			case "b":
+				if isScanning {
+					terminal.DisplayBroadcastStorms()
+				} else {
+					fmt.Println("\nNo broadcast storms detected. Press 's' to start monitoring.")
+				}
+			case "m":
+				if isScanning {
+					terminal.DisplayDuplicateMACs()
+				} else {
+					fmt.Println("\nNo duplicate MACs detected. Press 's' to start monitoring.")
+				}
+			case "t":
+				if isScanning {
+					terminal.DisplaySTPInfo()
+				} else {
+					fmt.Println("\nNo STP data available. Press 's' to start monitoring.")
+				}
+			case "a":
+				if isScanning {
+					terminal.DisplayLoopAnalysis()
+				} else {
+					fmt.Println("\nNo analysis available. Press 's' to start monitoring.")
+				}
+			case "e":
+				terminal.ExportEvents()
 			}
 		case err := <-errChan:
 			if err != nil {
@@ -142,18 +173,92 @@ func main() {
 	}
 }
 
+// parseFlags handles command line argument parsing
+func parseFlags() *config.Config {
+	cfg := config.DefaultConfig()
+
+	// Define flags
+	configFile := flag.String("config", "", "Path to configuration file (JSON)")
+	threshold := flag.Int("threshold", 0, "Packet count threshold for loop detection")
+	sampleTime := flag.Int("sample-time", 0, "Sampling period in seconds")
+	broadcastThreshold := flag.Int("broadcast-threshold", 0, "Broadcast storm threshold (packets/second)")
+	logFile := flag.String("log", "", "Path to log file for event recording")
+	jsonOutput := flag.Bool("json", false, "Output log in JSON format")
+	bpfFilter := flag.String("filter", "", "Custom BPF filter (e.g., 'ether proto 0x8809')")
+	noBell := flag.Bool("no-bell", false, "Disable terminal bell for alerts")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "SpanScan - Network Loop & STP Issue Detector\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s --threshold=50 --sample-time=5\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --log=events.log --json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --filter='ether dst 01:80:c2:00:00:00'\n", os.Args[0])
+	}
+
+	flag.Parse()
+
+	// Load config file if specified
+	if *configFile != "" {
+		fileCfg, err := config.LoadFromFile(*configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Could not load config file: %v\n", err)
+		} else {
+			cfg = fileCfg
+		}
+	}
+
+	// Override with command line flags
+	if *threshold > 0 {
+		cfg.PacketCountThreshold = *threshold
+	}
+	if *sampleTime > 0 {
+		cfg.SamplingPeriod = time.Duration(*sampleTime) * time.Second
+	}
+	if *broadcastThreshold > 0 {
+		cfg.BroadcastStormThreshold = *broadcastThreshold
+	}
+	if *logFile != "" {
+		cfg.LogFile = *logFile
+	}
+	if *jsonOutput {
+		cfg.JSONOutput = true
+	}
+	if *bpfFilter != "" {
+		cfg.BPFFilter = *bpfFilter
+	}
+	if *noBell {
+		cfg.EnableBell = false
+	}
+
+	return cfg
+}
+
 // displayWelcomeMessage shows initial instructions when the app starts
-func displayWelcomeMessage() {
+func displayWelcomeMessage(cfg *config.Config) {
 	fmt.Println("\nWelcome to SpanScan!")
 	fmt.Println("\nThis tool helps detect network loops and STP issues on your network.")
+
+	// Show current configuration
+	fmt.Println("\nCurrent settings:")
+	fmt.Printf("  • Loop threshold: %d packets per %s\n", cfg.PacketCountThreshold, cfg.SamplingPeriod)
+	fmt.Printf("  • Broadcast storm threshold: %d packets/sec\n", cfg.BroadcastStormThreshold)
+	if cfg.BPFFilter != "" {
+		fmt.Printf("  • BPF filter: %s\n", cfg.BPFFilter)
+	} else {
+		fmt.Println("  • BPF filter: (capturing all traffic)")
+	}
+	if cfg.LogFile != "" {
+		fmt.Printf("  • Logging to: %s\n", cfg.LogFile)
+	}
+
 	fmt.Println("\nAvailable commands:")
-	fmt.Println("  s - Start monitoring")
-	fmt.Println("  p - Pause monitoring")
-	fmt.Println("  r - Refresh display")
-	fmt.Println("  d - Show detected devices")
-	fmt.Println("  i - Show network interfaces")
-	fmt.Println("  l - Show detected loops")
-	fmt.Println("  h - Show help")
+	fmt.Println("  s - Start monitoring    l - Show loops      d - Show devices")
+	fmt.Println("  p - Pause monitoring    b - Broadcast storms  m - Duplicate MACs")
+	fmt.Println("  r - Refresh display     t - STP topology    a - Loop analysis")
+	fmt.Println("  i - Show interfaces     e - Export events   h - Help")
 	fmt.Println("  q - Quit")
 	fmt.Println("\nTo begin, press 's' to start monitoring...")
 }
