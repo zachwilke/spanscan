@@ -4,7 +4,7 @@
 
 SpanScan is a real-time network monitoring tool designed to detect Layer 2 network loops, broadcast storms, and Spanning Tree Protocol (STP) misconfigurations. It uses multiple detection algorithms running in parallel to identify loop sources with high confidence.
 
-![SpanScan TUI](docs/tui-screenshot.png)
+![SpanScan TUI](docs/screenshot.png)
 
 ---
 

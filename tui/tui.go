@@ -12,97 +12,119 @@ import (
 	"github.com/spanscan/detector"
 )
 
-// Theme colors - Modern dark theme with accent colors
+// Tokyo Night color palette
+// https://github.com/enkia/tokyo-night-vscode-theme
 var (
-	// Primary colors
-	primaryColor   = lipgloss.Color("#7C3AED") // Purple
-	secondaryColor = lipgloss.Color("#06B6D4") // Cyan
-	accentColor    = lipgloss.Color("#F59E0B") // Amber
-
-	// Severity colors
-	criticalColor = lipgloss.Color("#EF4444") // Red
-	highColor     = lipgloss.Color("#F97316") // Orange
-	mediumColor   = lipgloss.Color("#FBBF24") // Yellow
-	lowColor      = lipgloss.Color("#22D3EE") // Cyan
-	infoColor     = lipgloss.Color("#22C55E") // Green
-
 	// Background colors
-	bgDark    = lipgloss.Color("#0F172A") // Slate 900
-	bgCard    = lipgloss.Color("#1E293B") // Slate 800
-	bgHover   = lipgloss.Color("#334155") // Slate 700
-	textMuted = lipgloss.Color("#94A3B8") // Slate 400
-	textLight = lipgloss.Color("#F1F5F9") // Slate 100
+	bgDark      = lipgloss.Color("#1a1b26") // Tokyo Night background
+	bgHighlight = lipgloss.Color("#24283b") // Tokyo Night highlight
+	bgCard      = lipgloss.Color("#1f2335") // Slightly lighter background
+	bgSelection = lipgloss.Color("#33467c") // Selection blue
+
+	// Foreground colors
+	fgDefault = lipgloss.Color("#a9b1d6") // Default text
+	fgBright  = lipgloss.Color("#c0caf5") // Bright text
+	fgMuted   = lipgloss.Color("#565f89") // Comments/muted
+	fgDark    = lipgloss.Color("#414868") // Darker text
+
+	// Accent colors
+	blue    = lipgloss.Color("#7aa2f7") // Primary blue
+	cyan    = lipgloss.Color("#7dcfff") // Cyan
+	purple  = lipgloss.Color("#bb9af7") // Purple/Magenta
+	magenta = lipgloss.Color("#ff007c") // Hot pink
+	green   = lipgloss.Color("#9ece6a") // Green
+	yellow  = lipgloss.Color("#e0af68") // Yellow/Orange
+	orange  = lipgloss.Color("#ff9e64") // Orange
+	red     = lipgloss.Color("#f7768e") // Red
+	teal    = lipgloss.Color("#73daca") // Teal
+
+	// Semantic colors
+	primaryColor   = blue
+	secondaryColor = cyan
+	accentColor    = purple
+
+	// Severity colors (using Tokyo Night palette)
+	criticalColor = red
+	highColor     = orange
+	mediumColor   = yellow
+	lowColor      = cyan
+	infoColor     = green
 
 	// Styles
 	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(primaryColor).
+			Foreground(fgBright).
+			Background(blue).
 			Bold(true).
 			Padding(0, 2)
 
 	subtitleStyle = lipgloss.NewStyle().
-			Foreground(textMuted).
+			Foreground(fgMuted).
 			Italic(true)
 
 	cardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#475569")).
+			BorderForeground(fgDark).
 			Padding(1, 2)
 
 	activeCardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(primaryColor).
+			BorderForeground(blue).
 			Padding(1, 2)
 
 	headerStyle = lipgloss.NewStyle().
-			Foreground(textLight).
+			Foreground(fgBright).
 			Bold(true).
 			MarginBottom(1)
 
 	valueStyle = lipgloss.NewStyle().
-			Foreground(secondaryColor).
+			Foreground(cyan).
 			Bold(true)
 
 	mutedStyle = lipgloss.NewStyle().
-			Foreground(textMuted)
+			Foreground(fgMuted)
 
 	criticalStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(criticalColor).
+			Foreground(lipgloss.Color("#1a1b26")).
+			Background(red).
 			Bold(true).
 			Padding(0, 1)
 
 	highStyle = lipgloss.NewStyle().
-			Foreground(highColor).
+			Foreground(orange).
 			Bold(true)
 
 	mediumStyle = lipgloss.NewStyle().
-			Foreground(mediumColor)
+			Foreground(yellow)
 
 	lowStyle = lipgloss.NewStyle().
-			Foreground(lowColor)
+			Foreground(cyan)
 
 	successStyle = lipgloss.NewStyle().
-			Foreground(infoColor)
+			Foreground(green)
 
 	tabActiveStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(primaryColor).
+			Foreground(lipgloss.Color("#1a1b26")).
+			Background(blue).
 			Padding(0, 2).
 			Bold(true)
 
 	tabInactiveStyle = lipgloss.NewStyle().
-				Foreground(textMuted).
+				Foreground(fgMuted).
 				Background(bgCard).
 				Padding(0, 2)
 
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(textLight).
-			Background(bgCard).
+			Foreground(fgDefault).
+			Background(bgHighlight).
 			Padding(0, 1)
 
 	helpStyle = lipgloss.NewStyle().
-			Foreground(textMuted)
+			Foreground(fgMuted)
+
+	// Logo style with Tokyo Night purple
+	logoStyle = lipgloss.NewStyle().
+			Foreground(purple).
+			Bold(true)
 )
 
 // Tab represents a navigation tab
@@ -405,7 +427,7 @@ func (m Model) renderStatCard(title string, value string, color lipgloss.Color) 
 		cardWidth = 30
 	}
 
-	titleStyled := lipgloss.NewStyle().Foreground(textMuted).Render(title)
+	titleStyled := lipgloss.NewStyle().Foreground(fgMuted).Render(title)
 	valueStyled := lipgloss.NewStyle().
 		Foreground(color).
 		Bold(true).
@@ -416,7 +438,7 @@ func (m Model) renderStatCard(title string, value string, color lipgloss.Color) 
 
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#475569")).
+		BorderForeground(fgDark).
 		Width(cardWidth).
 		Padding(1, 2).
 		Align(lipgloss.Center).
@@ -622,7 +644,7 @@ func (m Model) renderLogsTab(height int) string {
 
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(textMuted).
+		BorderForeground(fgMuted).
 		Padding(1, 2).
 		Width(m.width - 4).
 		Render(strings.Join(rows, "\n"))
@@ -630,7 +652,7 @@ func (m Model) renderLogsTab(height int) string {
 
 func (m Model) renderTableHeader(columns []string) string {
 	header := strings.Join(columns, "  ")
-	return lipgloss.NewStyle().Bold(true).Foreground(textLight).Render(header)
+	return lipgloss.NewStyle().Bold(true).Foreground(fgBright).Render(header)
 }
 
 func (m Model) renderEmptyState(icon, title, subtitle string) string {
