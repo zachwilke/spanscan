@@ -6,9 +6,11 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/spanscan/config"
 	"github.com/spanscan/detector"
 )
 
@@ -135,6 +137,7 @@ const (
 	TabLoops
 	TabDevices
 	TabSTP
+	TabSettings
 	TabLogs
 )
 
@@ -148,12 +151,26 @@ func (t Tab) String() string {
 		return "🖥️ Devices"
 	case TabSTP:
 		return "🌳 STP"
+	case TabSettings:
+		return "⚙️ Settings"
 	case TabLogs:
 		return "📋 Logs"
 	default:
 		return "Unknown"
 	}
 }
+
+// Form fields
+type formField int
+
+const (
+	fieldAddress formField = iota
+	fieldVersion
+	fieldCommunity
+	fieldUsername
+	fieldAuthPass
+	fieldPrivPass
+)
 
 // Model represents the TUI state
 type Model struct {
@@ -167,6 +184,11 @@ type Model struct {
 	viewport     viewport.Model
 	ready        bool
 	scrollPos    int
+
+	// Settings Form
+	inputs      []textinput.Model
+	focusedIdx  int
+	snmpVersion config.SNMPVersion
 
 	// Cached data for display
 	loops   []*detector.LoopInfo
@@ -186,10 +208,56 @@ func New(det *detector.Detector) Model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(primaryColor)
 
+	// Initialize inputs
+	inputs := make([]textinput.Model, 6)
+
+	inputs[fieldAddress] = textinput.New()
+	inputs[fieldAddress].Placeholder = "192.168.1.10"
+	inputs[fieldAddress].Focus()
+	inputs[fieldAddress].CharLimit = 100
+	inputs[fieldAddress].Width = 30
+	inputs[fieldAddress].Prompt = "Address: "
+
+	inputs[fieldVersion] = textinput.New()
+	inputs[fieldVersion].Placeholder = "v2c"
+	inputs[fieldVersion].CharLimit = 10
+	inputs[fieldVersion].Width = 10
+	inputs[fieldVersion].Prompt = "Version (v1/v2c/v3): "
+	inputs[fieldVersion].SetValue("v2c")
+
+	inputs[fieldCommunity] = textinput.New()
+	inputs[fieldCommunity].Placeholder = "public"
+	inputs[fieldCommunity].CharLimit = 30
+	inputs[fieldCommunity].Width = 20
+	inputs[fieldCommunity].Prompt = "Community: "
+	inputs[fieldCommunity].EchoMode = textinput.EchoPassword
+
+	inputs[fieldUsername] = textinput.New()
+	inputs[fieldUsername].Placeholder = "user"
+	inputs[fieldUsername].CharLimit = 30
+	inputs[fieldUsername].Width = 20
+	inputs[fieldUsername].Prompt = "Username (v3): "
+
+	inputs[fieldAuthPass] = textinput.New()
+	inputs[fieldAuthPass].Placeholder = "authpass"
+	inputs[fieldAuthPass].CharLimit = 30
+	inputs[fieldAuthPass].Width = 20
+	inputs[fieldAuthPass].Prompt = "Auth Pass (v3): "
+	inputs[fieldAuthPass].EchoMode = textinput.EchoPassword
+
+	inputs[fieldPrivPass] = textinput.New()
+	inputs[fieldPrivPass].Placeholder = "privpass"
+	inputs[fieldPrivPass].CharLimit = 30
+	inputs[fieldPrivPass].Width = 20
+	inputs[fieldPrivPass].Prompt = "Priv Pass (v3): "
+	inputs[fieldPrivPass].EchoMode = textinput.EchoPassword
+
 	return Model{
-		detector:  det,
-		activeTab: TabDashboard,
-		spinner:   s,
+		detector:    det,
+		activeTab:   TabDashboard,
+		spinner:     s,
+		inputs:      inputs,
+		snmpVersion: config.SNMPVersion2c,
 	}
 }
 
@@ -198,6 +266,7 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
 		tickCmd(),
+		textinput.Blink,
 	)
 }
 
@@ -213,16 +282,77 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Global keys
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			if m.isMonitoring {
 				m.detector.Stop()
 			}
 			return m, tea.Quit
-		case "tab", "right", "l":
-			m.activeTab = (m.activeTab + 1) % 5
-		case "shift+tab", "left", "h":
-			m.activeTab = (m.activeTab + 4) % 5
+		case "tab":
+			if m.activeTab == TabSettings {
+				// Cycle focus in settings
+				m.nextInput()
+			} else {
+				m.activeTab = (m.activeTab + 1) % 6
+			}
+		case "shift+tab":
+			if m.activeTab == TabSettings {
+				m.prevInput()
+			} else {
+				m.activeTab = (m.activeTab + 5) % 6
+			}
+		case "left", "h":
+			if m.activeTab != TabSettings {
+				m.activeTab = (m.activeTab + 5) % 6
+			}
+		case "right", "l":
+			if m.activeTab != TabSettings {
+				m.activeTab = (m.activeTab + 1) % 6
+			}
+		}
+
+		// Tab specific handling
+		if m.activeTab == TabSettings {
+			switch msg.String() {
+			case "enter":
+				if m.focusedIdx == len(m.inputs)-1 {
+					// Add target
+					m.addTarget()
+				} else {
+					m.nextInput()
+				}
+			case "esc":
+				m.activeTab = TabDashboard
+			case "backspace":
+				// Handle backspace for version toggle
+			}
+
+			// Handle version toggle logic slightly differently or just text input
+			// For simplicity, let's keep it as text input but update state
+			val := m.inputs[fieldVersion].Value()
+			if val == "v3" {
+				m.snmpVersion = config.SNMPVersion3
+			} else {
+				m.snmpVersion = config.SNMPVersion2c
+			}
+
+			// Update text inputs
+			for i := range m.inputs {
+				var cmd tea.Cmd
+				m.inputs[i], cmd = m.inputs[i].Update(msg)
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
+		}
+
+		// Other tabs
+		switch msg.String() {
+		case "q":
+			if m.isMonitoring {
+				m.detector.Stop()
+			}
+			return m, tea.Quit
 		case "s":
 			if !m.isMonitoring {
 				m.isMonitoring = true
@@ -245,6 +375,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "4":
 			m.activeTab = TabSTP
 		case "5":
+			m.activeTab = TabSettings
+		case "6":
 			m.activeTab = TabLogs
 		case "j", "down":
 			m.scrollPos++
@@ -276,6 +408,74 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) nextInput() {
+	m.focusedIdx = (m.focusedIdx + 1) % len(m.inputs)
+	for i := 0; i < len(m.inputs); i++ {
+		if i == m.focusedIdx {
+			m.inputs[i].Focus()
+		} else {
+			m.inputs[i].Blur()
+		}
+	}
+}
+
+func (m *Model) prevInput() {
+	m.focusedIdx--
+	if m.focusedIdx < 0 {
+		m.focusedIdx = len(m.inputs) - 1
+	}
+	for i := 0; i < len(m.inputs); i++ {
+		if i == m.focusedIdx {
+			m.inputs[i].Focus()
+		} else {
+			m.inputs[i].Blur()
+		}
+	}
+}
+
+func (m *Model) addTarget() {
+	addr := m.inputs[fieldAddress].Value()
+	ver := m.inputs[fieldVersion].Value()
+
+	if addr == "" {
+		return
+	}
+
+	cfg := config.SNMPTargetConfig{
+		Address: addr,
+		Version: config.SNMPVersion(ver),
+	}
+
+	if ver == "v3" {
+		cfg.Username = m.inputs[fieldUsername].Value()
+		cfg.AuthPass = m.inputs[fieldAuthPass].Value()
+		cfg.PrivPass = m.inputs[fieldPrivPass].Value()
+		cfg.SecurityLevel = "AuthPriv"
+		cfg.AuthProto = "SHA"
+		cfg.PrivProto = "AES"
+	} else {
+		cfg.Community = m.inputs[fieldCommunity].Value()
+	}
+
+	// Add to detector
+	m.detector.AddTarget(cfg)
+
+	// Add to config targets (persistence logic needs to be added to Detector or main to save back)
+	// For TUI just adding to runtime
+	// To persist:
+	// m.detector.GetConfig().Targets = append(m.detector.GetConfig().Targets, cfg)
+	// m.detector.GetConfig().SaveToFile(...)
+
+	conf := m.detector.GetConfig()
+	conf.Targets = append(conf.Targets, cfg)
+	conf.SaveToFile("config.json") // Auto-save
+
+	// Reset inputs
+	m.inputs[fieldAddress].SetValue("")
+	m.inputs[fieldAddress].Focus()
+	m.focusedIdx = 0
 }
 
 // View renders the UI
@@ -338,7 +538,7 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderTabs() string {
-	tabs := []Tab{TabDashboard, TabLoops, TabDevices, TabSTP, TabLogs}
+	tabs := []Tab{TabDashboard, TabLoops, TabDevices, TabSTP, TabSettings, TabLogs}
 	var renderedTabs []string
 
 	for _, tab := range tabs {
@@ -362,11 +562,64 @@ func (m Model) renderContent(height int) string {
 		return m.renderDevicesTab(height)
 	case TabSTP:
 		return m.renderSTPTab(height)
+	case TabSettings:
+		return m.renderSettingsTab(height)
 	case TabLogs:
 		return m.renderLogsTab(height)
 	default:
 		return ""
 	}
+}
+
+func (m Model) renderSettingsTab(height int) string {
+	var b strings.Builder
+
+	b.WriteString(headerStyle.Render("Add SNMP Target"))
+	b.WriteString("\n\n")
+
+	// Render inputs
+	for i := range m.inputs {
+		// Hide v3 fields if v1/v2c selected
+		if m.snmpVersion != config.SNMPVersion3 && i >= int(fieldUsername) {
+			continue
+		}
+		// Hide community if v3 selected
+		if m.snmpVersion == config.SNMPVersion3 && i == int(fieldCommunity) {
+			continue
+		}
+
+		b.WriteString(m.inputs[i].View())
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	btnStyle := activeCardStyle
+	if m.focusedIdx == len(m.inputs) {
+		btnStyle = btnStyle.Background(primaryColor).Foreground(lipgloss.Color("#1a1b26"))
+	}
+	b.WriteString(btnStyle.Render("[ Add Target (Enter) ]"))
+
+	b.WriteString("\n\n")
+	b.WriteString(headerStyle.Render("Configured Targets"))
+	b.WriteString("\n")
+
+	// List existing
+	targets := m.detector.GetConfig().Targets
+	if len(targets) == 0 {
+		b.WriteString(mutedStyle.Render("No targets configured"))
+	} else {
+		for i, t := range targets {
+			b.WriteString(fmt.Sprintf("%d. %s (%s)\n", i+1, t.Address, t.Version))
+		}
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(fgMuted).
+		Padding(1, 2).
+		Width(m.width - 4).
+		Height(height).
+		Render(b.String())
 }
 
 func (m Model) renderDashboard(height int) string {
@@ -391,7 +644,7 @@ func (m Model) renderDashboard(height int) string {
 	}
 
 	// Create stat cards with icons
-	packetsCard := m.renderStatCardSized("Packets", fmt.Sprintf("%v", stats["totalPackets"]), "📦", cyan, cardWidth)
+	packetsCard := m.renderStatCardSized("Polls/Pkts", fmt.Sprintf("%v", stats["totalPackets"]), "📦", cyan, cardWidth)
 	devicesCard := m.renderStatCardSized("Devices", fmt.Sprintf("%v", stats["devicesDetected"]), "🖥️", green, cardWidth)
 	loopsCard := m.renderStatCardSized("Loops", fmt.Sprintf("%v", stats["loopsDetected"]), "🔴", m.getLoopColor(), cardWidth)
 	dupMACsCard := m.renderStatCardSized("Dup MACs", fmt.Sprintf("%v", stats["duplicateMACs"]), "🔀", yellow, cardWidth)
@@ -423,10 +676,10 @@ func (m Model) renderWelcome() string {
 		Align(lipgloss.Center).
 		Render(
 			headerStyle.Render("Welcome to SpanScan!") + "\n\n" +
-				mutedStyle.Render("Network Loop & STP Issue Detector") + "\n\n" +
-				"Press " + valueStyle.Render("s") + " to start monitoring\n" +
+				mutedStyle.Render("Network Loop & STP Issue Detector (SNMP Mode)") + "\n\n" +
+				"Press " + valueStyle.Render("s") + " to start polling\n" +
 				"Press " + valueStyle.Render("q") + " to quit\n\n" +
-				subtitleStyle.Render("Use Tab or 1-5 to switch views"))
+				"Configure targets in " + valueStyle.Render("Settings"))
 
 	return lipgloss.Place(m.width-4, 15, lipgloss.Center, lipgloss.Center, welcome)
 }
@@ -749,9 +1002,14 @@ func (m Model) renderSeverity(severity detector.LoopSeverity) string {
 }
 
 func (m Model) renderStatusBar() string {
-	left := " SpanScan v2.0"
+	left := " SpanScan v2.1"
 
-	help := "s:start  p:pause  Tab:switch  q:quit  ↑↓:scroll"
+	// Default help
+	help := "s:start  p:pause  Tab:switch  q:quit"
+
+	if m.activeTab == TabSettings {
+		help = "Tab:next_field  Enter:add_target"
+	}
 
 	right := ""
 	if m.isMonitoring {
@@ -791,19 +1049,12 @@ func formatDuration(d time.Duration) string {
 	d -= h * time.Hour
 	m := d / time.Minute
 	d -= m * time.Minute
-	s := d / time.Second
+	sec := d / time.Second
 
 	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
+		return fmt.Sprintf("%dh %dm %ds", h, m, sec)
 	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
+		return fmt.Sprintf("%dm %ds", m, sec)
 	}
-	return fmt.Sprintf("%ds", s)
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-1] + "…"
+	return fmt.Sprintf("%ds", sec)
 }

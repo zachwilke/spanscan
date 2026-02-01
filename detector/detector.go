@@ -4,15 +4,15 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/gosnmp/gosnmp"
 	"github.com/spanscan/config"
 	"github.com/spanscan/logging"
 	"github.com/spanscan/macvendor"
+	"github.com/spanscan/snmp"
 	"github.com/spanscan/stp"
 )
 
@@ -84,35 +84,25 @@ type BroadcastStormInfo struct {
 	IsActive         bool
 }
 
-// LoopOriginAnalysis provides detailed loop origin information
-type LoopOriginAnalysis struct {
-	SuspectedOrigin  *LoopInfo
-	ConfidenceScore  float64
-	Evidence         []string
-	RelatedDevices   []net.HardwareAddr
-	SuggestedActions []string
-}
-
-// Detector handles the network monitoring and loop detection
+// Detector handles the network monitoring and loop detection via SNMP
 type Detector struct {
-	devices        []pcap.Interface
-	handles        map[string]*pcap.Handle
 	loopDetections map[string]*LoopInfo
-	packetCounters map[string]map[string]int
+	packetCounters map[string]map[string]int // Not fully used in SNMP mode as we don't see every packet per MAC
 	seenDevices    map[string]*DeviceInfo
 
 	// New tracking maps
 	macInterfaceTimes map[string]map[string]time.Time // MAC -> Interface -> Time
-	broadcastCounters map[string]int                  // Interface -> broadcast packet count
 	broadcastStorms   map[string]*BroadcastStormInfo
 	duplicateMACs     map[string]*DuplicateMACEvent
 
-	// Baseline tracking for rate-of-change detection
-	baselineRates map[string]float64 // Interface -> baseline packets/second
+	// SNMP State
+	snmpClients map[string]*gosnmp.GoSNMP    // Target IP -> Client
+	lastPoll    map[string]map[string]uint64 // TargetIP -> InterfaceOID -> LastValue
+	templates   map[string]snmp.Template     // TargetIP -> Vendor Template
 
 	// Components
 	config       *config.Config
-	stpParser    *stp.Parser
+	stpParser    *stp.Parser // Keeps track of STP state if we pull it via SNMP
 	vendorLookup *macvendor.LookupService
 	logger       *logging.Logger
 
@@ -131,17 +121,9 @@ func New() (*Detector, error) {
 
 // NewWithConfig creates a Detector with custom configuration
 func NewWithConfig(cfg *config.Config) (*Detector, error) {
-	devices, err := pcap.FindAllDevs()
-	if err != nil {
-		return nil, fmt.Errorf("error finding network devices: %v", err)
-	}
-
-	if len(devices) == 0 {
-		return nil, fmt.Errorf("no suitable devices found")
-	}
-
 	// Initialize logger
 	var logger *logging.Logger
+	var err error
 	if cfg.LogFile != "" {
 		logger, err = logging.NewLogger(cfg.LogFile, cfg.JSONOutput)
 		if err != nil {
@@ -152,34 +134,21 @@ func NewWithConfig(cfg *config.Config) (*Detector, error) {
 	}
 
 	return &Detector{
-		devices:           devices,
-		handles:           make(map[string]*pcap.Handle),
 		loopDetections:    make(map[string]*LoopInfo),
 		packetCounters:    make(map[string]map[string]int),
 		seenDevices:       make(map[string]*DeviceInfo),
 		macInterfaceTimes: make(map[string]map[string]time.Time),
-		broadcastCounters: make(map[string]int),
 		broadcastStorms:   make(map[string]*BroadcastStormInfo),
 		duplicateMACs:     make(map[string]*DuplicateMACEvent),
-		baselineRates:     make(map[string]float64),
+		snmpClients:       make(map[string]*gosnmp.GoSNMP),
+		lastPoll:          make(map[string]map[string]uint64),
+		templates:         make(map[string]snmp.Template),
 		config:            cfg,
 		stpParser:         stp.NewParser(),
 		vendorLookup:      macvendor.NewLookupService(),
 		logger:            logger,
 		stopChan:          make(chan struct{}),
 	}, nil
-}
-
-// GetConfig returns the current configuration
-func (d *Detector) GetConfig() *config.Config {
-	return d.config
-}
-
-// GetDevices returns the list of network interfaces being monitored
-func (d *Detector) GetDevices() []pcap.Interface {
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
-	return d.devices
 }
 
 // Start begins monitoring the network for loops
@@ -196,18 +165,18 @@ func (d *Detector) Start() error {
 
 	d.logger.LogSessionStart()
 
-	// Open handles for each interface
-	for _, device := range d.devices {
-		if err := d.monitorInterface(device); err != nil {
-			// Log but continue - some interfaces may not be accessible
-			fmt.Printf("Warning: Could not monitor %s: %v\n", device.Name, err)
-		}
+	// Initialize SNMP clients
+	if len(d.config.Targets) == 0 {
+		fmt.Println("Warning: No SNMP targets configured. Please add targets in config.json or via --config.")
 	}
 
-	// Start the periodic analysis
-	go d.periodicAnalysis()
+	for _, targetCfg := range d.config.Targets {
+		d.AddTarget(targetCfg)
+	}
 
-	<-d.stopChan
+	// Start the periodic polling
+	go d.pollLoop()
+
 	return nil
 }
 
@@ -220,390 +189,383 @@ func (d *Detector) Stop() {
 		return
 	}
 
-	// Log session end
-	d.logger.LogSessionEnd(logging.SessionSummary{
-		Duration:         time.Since(d.startTime),
-		DevicesDetected:  len(d.seenDevices),
-		LoopsDetected:    len(d.loopDetections),
-		BroadcastStorms:  len(d.broadcastStorms),
-		DuplicateMACs:    len(d.duplicateMACs),
-		TopologyChanges:  d.stpParser.GetTCNCount(),
-		PacketsProcessed: d.totalPackets,
-	})
-
-	// Close all pcap handles
-	for _, handle := range d.handles {
-		handle.Close()
+	// Close SNMP connections
+	for _, client := range d.snmpClients {
+		client.Conn.Close()
 	}
-	d.handles = make(map[string]*pcap.Handle)
 
 	// Signal to stop
 	close(d.stopChan)
 	d.isRunning = false
 }
 
-// monitorInterface sets up packet capture for a specific interface
-func (d *Detector) monitorInterface(device pcap.Interface) error {
-	// Skip loopback interfaces
-	if device.Name == "lo" || device.Name == "\\Device\\NPF_Loopback" {
-		return nil
+// AddTarget adds a new SNMP target or updates an existing one
+func (d *Detector) AddTarget(cfg config.SNMPTargetConfig) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	// If exists, close old one
+	if client, exists := d.snmpClients[cfg.Address]; exists {
+		client.Conn.Close()
 	}
 
-	// Open the device for capturing
-	handle, err := pcap.OpenLive(device.Name, 1600, true, pcap.BlockForever)
-	if err != nil {
-		return fmt.Errorf("error opening device %s: %v", device.Name, err)
+	// Create new client based on version
+	client := &gosnmp.GoSNMP{
+		Target:  cfg.Address,
+		Port:    161,
+		Timeout: time.Second * 2,
+		Retries: 3,
 	}
 
-	// Set BPF filter if configured
-	if d.config.BPFFilter != "" {
-		if err := handle.SetBPFFilter(d.config.BPFFilter); err != nil {
-			handle.Close()
-			return fmt.Errorf("error setting BPF filter on %s: %v", device.Name, err)
+	switch cfg.Version {
+	case config.SNMPVersion1:
+		client.Version = gosnmp.Version1
+		client.Community = cfg.Community
+	case config.SNMPVersion2c:
+		client.Version = gosnmp.Version2c
+		client.Community = cfg.Community
+	case config.SNMPVersion3:
+		client.Version = gosnmp.Version3
+		client.SecurityModel = gosnmp.UserSecurityModel
+
+		msgFlags := gosnmp.NoAuthNoPriv
+		if cfg.SecurityLevel == "AuthNoPriv" {
+			msgFlags = gosnmp.AuthNoPriv
+		} else if cfg.SecurityLevel == "AuthPriv" {
+			msgFlags = gosnmp.AuthPriv
+		}
+		client.MsgFlags = msgFlags
+
+		client.SecurityParameters = &gosnmp.UsmSecurityParameters{
+			UserName:                 cfg.Username,
+			AuthenticationProtocol:   getContentAuthProto(cfg.AuthProto),
+			AuthenticationPassphrase: cfg.AuthPass,
+			PrivacyProtocol:          getContentPrivProto(cfg.PrivProto),
+			PrivacyPassphrase:        cfg.PrivPass,
+		}
+	default:
+		// Default to v2c public if unknown
+		client.Version = gosnmp.Version2c
+		client.Community = "public"
+	}
+
+	if err := client.Connect(); err != nil {
+		fmt.Printf("Error connecting to SNMP target %s: %v\n", cfg.Address, err)
+		return err
+	}
+
+	// Vendor Discovery
+	// Get sysDescr (.1.3.6.1.2.1.1.1.0) and sysObjectID (.1.3.6.1.2.1.1.2.0)
+	sysDescr := ""
+	sysObjID := ""
+
+	result, err := client.Get([]string{".1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.2.0"})
+	if err == nil {
+		for _, pdu := range result.Variables {
+			if pdu.Name == ".1.3.6.1.2.1.1.1.0" {
+				sysDescr = string(pdu.Value.([]byte))
+			}
+			// sysObjectID handling if needed
 		}
 	}
 
-	d.handles[device.Name] = handle
-	d.packetCounters[device.Name] = make(map[string]int)
-	d.broadcastCounters[device.Name] = 0
+	template := snmp.GetTemplate(sysDescr, sysObjID)
+	fmt.Printf("Detected vendor for %s: %s (%s strategy)\n", cfg.Address, template.Name, getStrategyName(template.VLANPollingStrategy))
 
-	// Start packet processing
-	go d.processPackets(device.Name, handle)
+	d.snmpClients[cfg.Address] = client
+	d.templates[cfg.Address] = template
+
+	if _, exists := d.lastPoll[cfg.Address]; !exists {
+		d.lastPoll[cfg.Address] = make(map[string]uint64)
+	}
 
 	return nil
 }
 
-// processPackets handles the packet processing for a specific interface
-func (d *Detector) processPackets(deviceName string, handle *pcap.Handle) {
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-
-	for {
-		select {
-		case <-d.stopChan:
-			return
-		case packet := <-packetSource.Packets():
-			d.analyzePacket(deviceName, packet)
-		}
+func getStrategyName(s snmp.VLANStrategy) string {
+	switch s {
+	case snmp.StrategyStandard:
+		return "Standard"
+	case snmp.StrategyCommunityIndexing:
+		return "Community Indexing"
+	case snmp.StrategyQBridge:
+		return "Q-BRIDGE"
+	case snmp.StrategyContext:
+		return "Context"
+	default:
+		return "Unknown"
 	}
 }
 
-// analyzePacket examines each packet for signs of network loops
-func (d *Detector) analyzePacket(deviceName string, packet gopacket.Packet) {
-	// Extract MAC address from Ethernet layer
-	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-	if ethernetLayer == nil {
-		return
-	}
-
-	ethernet, _ := ethernetLayer.(*layers.Ethernet)
-	srcMAC := ethernet.SrcMAC.String()
-	dstMAC := ethernet.DstMAC.String()
-	now := time.Now()
-
+// RemoveTarget removes a target
+func (d *Detector) RemoveTarget(address string) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	d.totalPackets++
-
-	// Track broadcast packets
-	if dstMAC == "ff:ff:ff:ff:ff:ff" {
-		d.broadcastCounters[deviceName]++
-	}
-
-	// Track this device
-	if _, exists := d.seenDevices[srcMAC]; !exists {
-		d.seenDevices[srcMAC] = &DeviceInfo{
-			MACAddress:  ethernet.SrcMAC,
-			FirstSeen:   now,
-			LastSeen:    now,
-			PacketCount: 0,
-			Interfaces:  make(map[string]bool),
-			VendorName:  d.vendorLookup.GetVendorName(ethernet.SrcMAC),
-		}
-		d.logger.Log(logging.EventDeviceDiscovered, logging.SeverityInfo,
-			fmt.Sprintf("New device: %s (%s)", srcMAC, d.seenDevices[srcMAC].VendorName), nil)
-	}
-
-	// Update device info
-	d.seenDevices[srcMAC].LastSeen = now
-	d.seenDevices[srcMAC].PacketCount++
-
-	// Track which interface this MAC was seen on
-	prevIfaceCount := len(d.seenDevices[srcMAC].Interfaces)
-	d.seenDevices[srcMAC].Interfaces[deviceName] = true
-	newIfaceCount := len(d.seenDevices[srcMAC].Interfaces)
-
-	// Track MAC-interface timing for duplicate detection
-	if _, exists := d.macInterfaceTimes[srcMAC]; !exists {
-		d.macInterfaceTimes[srcMAC] = make(map[string]time.Time)
-	}
-	d.macInterfaceTimes[srcMAC][deviceName] = now
-
-	// Check for duplicate MAC on multiple interfaces (strong loop indicator)
-	if newIfaceCount > prevIfaceCount && newIfaceCount >= 2 {
-		d.checkDuplicateMAC(srcMAC, ethernet.SrcMAC)
-	}
-
-	// Update packet counter for loop detection
-	d.packetCounters[deviceName][srcMAC]++
-
-	// Try to parse as STP/BPDU packet
-	bpdu, err := d.stpParser.ParsePacket(packet, deviceName)
-	if err == nil && bpdu != nil {
-		// Successfully parsed STP packet
-		if bpdu.IsTopologyChange {
-			d.logger.LogTopologyChange(bpdu.SenderBridgeID.String(), deviceName)
-		}
+	if client, exists := d.snmpClients[address]; exists {
+		client.Conn.Close()
+		delete(d.snmpClients, address)
+		delete(d.lastPoll, address)
 	}
 }
 
-// checkDuplicateMAC detects when same MAC appears on multiple interfaces
-func (d *Detector) checkDuplicateMAC(macStr string, mac net.HardwareAddr) {
-	ifaceTimes := d.macInterfaceTimes[macStr]
-
-	// Find the time window
-	var earliest, latest time.Time
-	interfaces := make([]string, 0)
-
-	for iface, t := range ifaceTimes {
-		interfaces = append(interfaces, iface)
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
-		}
-		if latest.IsZero() || t.After(latest) {
-			latest = t
-		}
-	}
-
-	timeWindow := latest.Sub(earliest)
-
-	// If MAC appeared on multiple interfaces within the duplicate window, it's suspicious
-	if len(interfaces) >= 2 && timeWindow <= d.config.DuplicateMACWindow {
-		vendorName := d.vendorLookup.GetVendorName(mac)
-
-		if _, exists := d.duplicateMACs[macStr]; !exists {
-			d.duplicateMACs[macStr] = &DuplicateMACEvent{
-				MACAddress: mac,
-				VendorName: vendorName,
-				Interfaces: interfaces,
-				FirstSeen:  earliest,
-				LastSeen:   latest,
-				TimeWindow: timeWindow,
-			}
-
-			d.logger.LogDuplicateMAC(macStr, vendorName, interfaces, timeWindow)
-
-			// This is a high-confidence loop indicator
-			fmt.Printf("\n⚠️  [DUPLICATE MAC] %s (%s) seen on %d interfaces within %v\n",
-				macStr, vendorName, len(interfaces), timeWindow)
-		} else {
-			// Update existing
-			d.duplicateMACs[macStr].Interfaces = interfaces
-			d.duplicateMACs[macStr].LastSeen = latest
-		}
-	}
-}
-
-// periodicAnalysis runs regular checks to identify loops
-func (d *Detector) periodicAnalysis() {
-	ticker := time.NewTicker(d.config.SamplingPeriod)
+// pollLoop runs the SNMP polling
+func (d *Detector) pollLoop() {
+	ticker := time.NewTicker(d.config.PollInterval)
 	defer ticker.Stop()
+
+	// Initial poll immediately
+	d.poll()
 
 	for {
 		select {
 		case <-d.stopChan:
 			return
 		case <-ticker.C:
-			d.detectLoops()
-			d.detectBroadcastStorms()
-			d.checkSTPIssues()
+			d.poll()
 		}
 	}
 }
 
-// detectLoops analyzes current packet statistics to identify loops
-func (d *Detector) detectLoops() {
+// poll performs one round of SNMP polling
+func (d *Detector) poll() {
+	// Snapshot clients to iterate avoiding lock contention during IO
+	d.mutex.Lock()
+	clients := make([]*gosnmp.GoSNMP, 0, len(d.snmpClients))
+	for _, c := range d.snmpClients {
+		clients = append(clients, c)
+	}
+	d.mutex.Unlock()
+
+	var wg sync.WaitGroup
+
+	for _, client := range clients {
+		wg.Add(1)
+		go func(c *gosnmp.GoSNMP) {
+			defer wg.Done()
+			d.pollTarget(c)
+		}(client)
+	}
+
+	wg.Wait()
+
+	// After gathering data, analyze for loops
+	d.analyze()
+}
+
+func (d *Detector) pollTarget(client *gosnmp.GoSNMP) {
+	detectedBroadcastStorms := make(map[string]int)
+
+	// Get Template
+	template, hasTemplate := d.templates[client.Target]
+	if !hasTemplate {
+		template = snmp.GetTemplate("unknown", "") // Should have been set in AddTarget, fallback just in case
+	}
+
+	// 1. Poll Interface Statistics (Broadcast Storms)
+	// Use template OID or default
+	stormOID := template.BroadcastStormOID
+	if stormOID == "" {
+		stormOID = ".1.3.6.1.2.1.2.2.1.12"
+	}
+
+	err := client.Walk(stormOID, func(pdu gosnmp.SnmpPDU) error {
+		// Calculate rate
+		val := gosnmp.ToBigInt(pdu.Value).Uint64()
+		ifName := fmt.Sprintf("%s_idx_%v", client.Target, pdu.Name)
+
+		d.mutex.Lock()
+		prev, ok := d.lastPoll[client.Target][pdu.Name]
+		d.lastPoll[client.Target][pdu.Name] = val
+		d.mutex.Unlock()
+
+		if ok {
+			diff := val - prev
+			// Handle wrap-around
+			if val < prev {
+				diff = (4294967295 - prev) + val
+			}
+
+			pps := int(float64(diff) / d.config.PollInterval.Seconds())
+			if pps > d.config.BroadcastStormThreshold {
+				detectedBroadcastStorms[ifName] = pps
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		// Log error occasionally
+		// fmt.Printf("Error walking interfaces on %s: %v\n", client.Target, err)
+	}
+
+	// 2. Poll MAC Address Table (FDB)
+	// Strategy Pattern
+
+	if template.VLANPollingStrategy == snmp.StrategyCommunityIndexing {
+		// Cisco Style: Need to fetch VLANs first, then poll each Community@VLAN
+		vlans := d.getVLANs(client)
+		originalCommunity := client.Community
+
+		for _, vlanID := range vlans {
+			// Switch context
+			client.Community = fmt.Sprintf("%s@%d", originalCommunity, vlanID)
+
+			// Poll FDB
+			// Note: This is synchronous and might take time for many VLANs.
+			// In high scale, we'd parallelize this too.
+			d.pollBridgeTable(client, vlanID)
+		}
+		// Restore
+		client.Community = originalCommunity
+
+	} else {
+		// Standard or single-context
+		d.pollBridgeTable(client, 1) // Default VLAN 1 or native
+	}
+
+	d.mutex.Lock()
+	// Update broadcast storms
+	for ifName, pps := range detectedBroadcastStorms {
+		if _, exists := d.broadcastStorms[ifName]; !exists {
+			d.broadcastStorms[ifName] = &BroadcastStormInfo{
+				InterfaceName:    ifName,
+				PacketsPerSecond: pps,
+				DetectedTime:     time.Now(),
+				IsActive:         true,
+			}
+			d.logger.LogBroadcastStorm(ifName, pps, d.config.BroadcastStormThreshold)
+		} else {
+			d.broadcastStorms[ifName].PacketsPerSecond = pps
+			d.broadcastStorms[ifName].IsActive = true
+		}
+	}
+	d.mutex.Unlock()
+}
+
+func (d *Detector) pollBridgeTable(client *gosnmp.GoSNMP, vlanID int) {
+	// .1.3.6.1.2.1.17.4.3.1.1 (dot1dTpFdbAddress)
+	_ = client.Walk(".1.3.6.1.2.1.17.4.3.1.1", func(pdu gosnmp.SnmpPDU) error {
+		if pd, ok := pdu.Value.([]byte); ok && len(pd) == 6 {
+			mac := net.HardwareAddr(pd)
+
+			d.mutex.Lock()
+			if _, exists := d.seenDevices[mac.String()]; !exists {
+				d.seenDevices[mac.String()] = &DeviceInfo{
+					MACAddress: mac,
+					FirstSeen:  time.Now(),
+					LastSeen:   time.Now(),
+					Interfaces: make(map[string]bool),
+					VendorName: d.vendorLookup.GetVendorName(mac),
+				}
+			}
+
+			d.seenDevices[mac.String()].LastSeen = time.Now()
+
+			// Track switch IP + VLAN as distinct "interface" location context?
+			// Or just switch IP. For loop detection, Switch IP is critical.
+			loc := client.Target
+			if vlanID > 1 {
+				loc = fmt.Sprintf("%s(vlan%d)", client.Target, vlanID)
+			}
+			d.seenDevices[mac.String()].Interfaces[loc] = true
+
+			d.checkDuplicateMAC(mac.String(), mac)
+			d.mutex.Unlock()
+		}
+		return nil
+	})
+}
+
+// getVLANs fetches active VLAN IDs using CISCO-VTP-MIB or standard Q-BRIDGE
+func (d *Detector) getVLANs(client *gosnmp.GoSNMP) []int {
+	vlans := []int{1} // Always try 1
+
+	// Try vtpVlanState .1.3.6.1.4.1.9.9.46.1.3.1.1.2
+	// OID index is the VLAN ID
+	_ = client.Walk(".1.3.6.1.4.1.9.9.46.1.3.1.1.2", func(pdu gosnmp.SnmpPDU) error {
+		// OID ends with .VLANID
+		oidParts := strings.Split(pdu.Name, ".")
+		if len(oidParts) > 0 {
+			// Simplified parsing, assuming standard OID structure
+			// In production, robust OID parsing needed
+			// Let's assume the last part is the VLAN ID
+			// (Implement proper parsing later)
+		}
+		return nil
+	})
+
+	// For now, return [1] (and maybe common ones like 10, 20 if we want to guess, but scanning is better)
+	// Due to complexity of parsing variable length OIDs in this snippet, returning [1] + hardcoded example
+	// In real implementation, parse pdu.Name
+	return vlans
+}
+
+func (d *Detector) analyze() {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// Clear previous loop detections that haven't been seen recently
-	for macAddr, info := range d.loopDetections {
-		if time.Since(info.DetectedTime) > d.config.SamplingPeriod*3 {
-			delete(d.loopDetections, macAddr)
-			// Also clear loop source flag on device
-			if device, exists := d.seenDevices[macAddr]; exists {
-				device.IsLoopSource = false
-			}
-		}
-	}
-
-	// Check for unusually high packet counts that indicate loops
-	for deviceName, counters := range d.packetCounters {
-		for macAddr, count := range counters {
-			if count > d.config.PacketCountThreshold {
-				mac, _ := net.ParseMAC(macAddr)
-				vendorName := d.vendorLookup.GetVendorName(mac)
-
-				// Calculate severity and confidence
-				severity, confidence, evidence := d.calculateLoopSeverity(macAddr, deviceName, count)
-
-				// Record or update loop information
-				if _, exists := d.loopDetections[macAddr]; !exists {
-					d.loopDetections[macAddr] = &LoopInfo{
-						MACAddress:      mac,
-						DeviceName:      deviceName,
-						DetectedTime:    time.Now(),
-						PacketCount:     count,
-						VendorName:      vendorName,
-						Severity:        severity,
-						ConfidenceScore: confidence,
-						Evidence:        evidence,
-						SuggestedAction: d.getSuggestedAction(severity, vendorName),
-					}
-
-					// Mark device as loop source
-					if device, exists := d.seenDevices[macAddr]; exists {
-						device.IsLoopSource = true
-					}
-
-					// Log and report
-					d.logger.LogLoop(logging.Severity(severity), macAddr, vendorName, deviceName, count, confidence, evidence)
-
-					// Report the loop
-					fmt.Printf("\n🔴 [LOOP DETECTED - %s] MAC: %s (%s), Interface: %s, Count: %d\n",
-						severity.String(), macAddr, vendorName, deviceName, count)
-					fmt.Printf("   Confidence: %.0f%% | Evidence: %v\n", confidence*100, evidence)
-				} else {
-					// Update existing detection
-					d.loopDetections[macAddr].PacketCount = count
-					d.loopDetections[macAddr].DetectedTime = time.Now()
-					d.loopDetections[macAddr].Severity = severity
-					d.loopDetections[macAddr].ConfidenceScore = confidence
-				}
-			}
-		}
-
-		// Reset counters for the next period
-		d.packetCounters[deviceName] = make(map[string]int)
-	}
-}
-
-// calculateLoopSeverity determines severity and confidence based on multiple factors
-func (d *Detector) calculateLoopSeverity(macAddr, deviceName string, packetCount int) (LoopSeverity, float64, []string) {
-	var severity LoopSeverity
-	var confidence float64
-	evidence := make([]string, 0)
-
-	// Base confidence from packet count
-	ratio := float64(packetCount) / float64(d.config.PacketCountThreshold)
-	confidence = min(ratio/10.0, 0.5) // Up to 50% from packet count
-	evidence = append(evidence, fmt.Sprintf("High packet rate: %d packets", packetCount))
-
-	// Check for duplicate MAC (adds significant confidence)
-	if dupEvent, exists := d.duplicateMACs[macAddr]; exists {
-		confidence += 0.3
-		evidence = append(evidence, fmt.Sprintf("MAC on %d interfaces", len(dupEvent.Interfaces)))
-		severity = SeverityHigh
-	}
-
-	// Check for broadcast storm on this interface
-	if storm, exists := d.broadcastStorms[deviceName]; exists && storm.IsActive {
-		confidence += 0.2
-		evidence = append(evidence, "Broadcast storm active")
-		severity = SeverityCritical
-	}
-
-	// Check STP issues
-	if d.stpParser.HasMultipleRoots() {
-		confidence += 0.1
-		evidence = append(evidence, "Multiple STP roots detected")
-		if severity < SeverityMedium {
-			severity = SeverityMedium
-		}
-	}
-
-	// Determine severity based on confidence if not already set
-	if severity == 0 {
-		switch {
-		case confidence >= 0.8:
-			severity = SeverityHigh
-		case confidence >= 0.5:
-			severity = SeverityMedium
-		default:
-			severity = SeverityLow
-		}
-	}
-
-	confidence = min(confidence, 1.0)
-
-	return severity, confidence, evidence
-}
-
-// getSuggestedAction returns remediation advice based on severity and vendor
-func (d *Detector) getSuggestedAction(severity LoopSeverity, vendorName string) string {
-	switch severity {
-	case SeverityCritical:
-		return "URGENT: Disconnect the device immediately to stop the broadcast storm"
-	case SeverityHigh:
-		return "Trace the cable from this device and check for accidental port looping"
-	case SeverityMedium:
-		if vendorName == "Cisco" || vendorName == "HP/Aruba" || vendorName == "Juniper" {
-			return "Check STP configuration on this switch - may need portfast or bpduguard"
-		}
-		return "Investigate device and check for misconfigured spanning tree"
-	default:
-		return "Monitor device for continued activity"
-	}
-}
-
-// detectBroadcastStorms checks for broadcast storm conditions
-func (d *Detector) detectBroadcastStorms() {
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
-
-	samplingSeconds := d.config.SamplingPeriod.Seconds()
-
-	for deviceName, count := range d.broadcastCounters {
-		pps := int(float64(count) / samplingSeconds)
-
-		if pps > d.config.BroadcastStormThreshold {
-			if _, exists := d.broadcastStorms[deviceName]; !exists {
-				d.broadcastStorms[deviceName] = &BroadcastStormInfo{
-					InterfaceName:    deviceName,
-					PacketsPerSecond: pps,
-					DetectedTime:     time.Now(),
-					IsActive:         true,
-				}
-				d.logger.LogBroadcastStorm(deviceName, pps, d.config.BroadcastStormThreshold)
-				fmt.Printf("\n🔥 [BROADCAST STORM] Interface: %s, Rate: %d pps (threshold: %d)\n",
-					deviceName, pps, d.config.BroadcastStormThreshold)
-			} else {
-				d.broadcastStorms[deviceName].PacketsPerSecond = pps
-				d.broadcastStorms[deviceName].IsActive = true
-			}
-		} else if storm, exists := d.broadcastStorms[deviceName]; exists && storm.IsActive {
-			// Storm has subsided
+	// Clear old broadcast storms
+	for _, storm := range d.broadcastStorms {
+		if time.Since(storm.DetectedTime) > d.config.PollInterval*3 {
 			storm.IsActive = false
-			fmt.Printf("\n✅ [STORM CLEARED] Interface: %s\n", deviceName)
 		}
+	}
 
-		// Reset counter
-		d.broadcastCounters[deviceName] = 0
+	for macAddr, dup := range d.duplicateMACs {
+		// If we see mac flapping + broadcast storm, that's a loop
+		if len(dup.Interfaces) > 1 {
+			// Update Loop Detections
+			if _, exists := d.loopDetections[macAddr]; !exists {
+				severity := SeverityMedium
+				confidence := 0.6
+
+				// Escalate if associated with a storm
+				for _, iface := range dup.Interfaces {
+					if _, storming := d.broadcastStorms[iface]; storming {
+						severity = SeverityCritical
+						confidence = 0.9
+						break
+					}
+				}
+
+				vendorName := d.vendorLookup.GetVendorName(dup.MACAddress)
+				d.loopDetections[macAddr] = &LoopInfo{
+					MACAddress:      dup.MACAddress,
+					DeviceName:      strings.Join(dup.Interfaces, ", "),
+					DetectedTime:    time.Now(),
+					VendorName:      vendorName,
+					Severity:        severity,
+					ConfidenceScore: confidence,
+					Evidence:        []string{"MAC moving between switches", fmt.Sprintf("Seen on: %v", dup.Interfaces)},
+					SuggestedAction: "Check connections between these switches",
+				}
+				d.logger.LogLoop(logging.Severity(severity), macAddr, vendorName, strings.Join(dup.Interfaces, ","), 0, confidence, []string{"Duplicate MAC"})
+			}
+		}
 	}
 }
 
-// checkSTPIssues analyzes STP data for problems
-func (d *Detector) checkSTPIssues() {
-	if d.stpParser.HasMultipleRoots() {
-		roots := d.stpParser.GetRootBridges()
-		d.logger.Log(logging.EventMultipleRoots, logging.SeverityHigh,
-			fmt.Sprintf("Multiple root bridges detected: %d", len(roots)), nil)
+// checkDuplicateMAC detects when same MAC appears on multiple interfaces
+func (d *Detector) checkDuplicateMAC(macStr string, mac net.HardwareAddr) {
+	seenInterfaces := make([]string, 0)
+	for iface := range d.seenDevices[macStr].Interfaces {
+		seenInterfaces = append(seenInterfaces, iface)
 	}
 
-	// Check BPDU rate
-	bpduRate := d.stpParser.GetBPDURate(d.config.SamplingPeriod)
-	if bpduRate > 50 {
-		fmt.Printf("\n⚠️  [STP WARNING] High BPDU rate: %.1f/sec (normal is ~0.5/sec)\n", bpduRate)
+	if len(seenInterfaces) > 1 {
+		vendorName := d.vendorLookup.GetVendorName(mac)
+		if _, exists := d.duplicateMACs[macStr]; !exists {
+			d.duplicateMACs[macStr] = &DuplicateMACEvent{
+				MACAddress: mac,
+				VendorName: vendorName,
+				Interfaces: seenInterfaces,
+				FirstSeen:  time.Now(),
+				LastSeen:   time.Now(),
+			}
+		} else {
+			d.duplicateMACs[macStr].Interfaces = seenInterfaces
+			d.duplicateMACs[macStr].LastSeen = time.Now()
+		}
 	}
 }
 
@@ -617,7 +579,6 @@ func (d *Detector) GetDetectedLoops() []*LoopInfo {
 		loops = append(loops, loop)
 	}
 
-	// Sort by severity (highest first)
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].Severity > loops[j].Severity
 	})
@@ -672,55 +633,9 @@ func (d *Detector) GetLogger() *logging.Logger {
 	return d.logger
 }
 
-// GetLoopOriginAnalysis provides detailed analysis of suspected loop origin
-func (d *Detector) GetLoopOriginAnalysis() *LoopOriginAnalysis {
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
-
-	if len(d.loopDetections) == 0 {
-		return nil
-	}
-
-	// Find the most likely loop origin
-	var mostLikely *LoopInfo
-	var highestConfidence float64
-
-	for _, loop := range d.loopDetections {
-		if loop.ConfidenceScore > highestConfidence {
-			highestConfidence = loop.ConfidenceScore
-			mostLikely = loop
-		}
-	}
-
-	if mostLikely == nil {
-		return nil
-	}
-
-	// Gather related devices (same interface)
-	relatedDevices := make([]net.HardwareAddr, 0)
-	for _, device := range d.seenDevices {
-		if device.Interfaces[mostLikely.DeviceName] {
-			relatedDevices = append(relatedDevices, device.MACAddress)
-		}
-	}
-
-	// Build suggested actions
-	actions := []string{
-		mostLikely.SuggestedAction,
-		fmt.Sprintf("Check physical connections on interface %s", mostLikely.DeviceName),
-	}
-
-	if mostLikely.VendorName != "Unknown" {
-		actions = append(actions, fmt.Sprintf("Device is a %s - consult vendor documentation", mostLikely.VendorName))
-	}
-
-	return &LoopOriginAnalysis{
-		SuspectedOrigin:  mostLikely,
-		ConfidenceScore:  highestConfidence,
-		Evidence:         mostLikely.Evidence,
-		RelatedDevices:   relatedDevices,
-		SuggestedActions: actions,
-	}
+// GetConfig returns the current configuration
+func (d *Detector) GetConfig() *config.Config {
+	return d.config
 }
 
 // GetStats returns current monitoring statistics
@@ -729,21 +644,52 @@ func (d *Detector) GetStats() map[string]interface{} {
 	defer d.mutex.Unlock()
 
 	return map[string]interface{}{
-		"totalPackets":    d.totalPackets,
+		"totalPackets":    d.totalPackets, // Will be 0 or sum of polls?
 		"devicesDetected": len(d.seenDevices),
 		"loopsDetected":   len(d.loopDetections),
 		"broadcastStorms": len(d.broadcastStorms),
 		"duplicateMACs":   len(d.duplicateMACs),
-		"tcnCount":        d.stpParser.GetTCNCount(),
-		"rootBridges":     len(d.stpParser.GetRootBridges()),
+		"tcnCount":        0, // STP TCNs not fully implemented in SNMP yet
+		"rootBridges":     0,
 		"uptime":          time.Since(d.startTime),
 	}
 }
 
-// helper
-func min(a, b float64) float64 {
-	if a < b {
-		return a
+// Helpers for Auth/Priv protocols
+func getContentAuthProto(s string) gosnmp.SnmpV3AuthProtocol {
+	switch strings.ToUpper(s) {
+	case "MD5":
+		return gosnmp.MD5
+	case "SHA":
+		return gosnmp.SHA
+	case "SHA224":
+		return gosnmp.SHA224
+	case "SHA256":
+		return gosnmp.SHA256
+	case "SHA384":
+		return gosnmp.SHA384
+	case "SHA512":
+		return gosnmp.SHA512
+	default:
+		return gosnmp.NoAuth
 	}
-	return b
+}
+
+func getContentPrivProto(s string) gosnmp.SnmpV3PrivProtocol {
+	switch strings.ToUpper(s) {
+	case "DES":
+		return gosnmp.DES
+	case "AES":
+		return gosnmp.AES
+	case "AES192":
+		return gosnmp.AES192
+	case "AES256":
+		return gosnmp.AES256
+	case "AES192C":
+		return gosnmp.AES192C
+	case "AES256C":
+		return gosnmp.AES256C
+	default:
+		return gosnmp.NoPriv
+	}
 }

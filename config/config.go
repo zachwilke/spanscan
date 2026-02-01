@@ -11,11 +11,11 @@ type Config struct {
 	// Detection thresholds
 	PacketCountThreshold    int           `json:"packetCountThreshold"`    // Packets per sampling period to trigger loop detection
 	BroadcastStormThreshold int           `json:"broadcastStormThreshold"` // Broadcast packets per second to trigger storm alert
-	SamplingPeriod          time.Duration `json:"samplingPeriod"`          // Time window for packet counting
+	PollInterval            time.Duration `json:"pollInterval"`            // Interval between SNMP polls
 	DuplicateMACWindow      time.Duration `json:"duplicateMACWindow"`      // Time window to detect same MAC on multiple interfaces
 
-	// BPF Filter - allows custom packet filtering
-	BPFFilter string `json:"bpfFilter"`
+	// SNMP Configuration
+	Targets []SNMPTargetConfig `json:"targets"`
 
 	// Logging configuration
 	LogFile    string `json:"logFile"`    // Path to log file (empty = no logging)
@@ -25,14 +25,38 @@ type Config struct {
 	EnableBell bool `json:"enableBell"` // Play terminal bell on critical alerts
 }
 
+// SNMPVersion enum
+type SNMPVersion string
+
+const (
+	SNMPVersion1  SNMPVersion = "v1"
+	SNMPVersion2c SNMPVersion = "v2c"
+	SNMPVersion3  SNMPVersion = "v3"
+)
+
+// SNMPTargetConfig holds configuration for a single SNMP target
+type SNMPTargetConfig struct {
+	Address   string      `json:"address"`
+	Version   SNMPVersion `json:"version"`
+	Community string      `json:"community,omitempty"` // v1, v2c
+
+	// v3 specific
+	Username      string `json:"username,omitempty"`
+	SecurityLevel string `json:"securityLevel,omitempty"` // NoAuthNoPriv, AuthNoPriv, AuthPriv
+	AuthProto     string `json:"authProto,omitempty"`     // MD5, SHA
+	AuthPass      string `json:"authPass,omitempty"`
+	PrivProto     string `json:"privProto,omitempty"` // DES, AES
+	PrivPass      string `json:"privPass,omitempty"`
+}
+
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
 		PacketCountThreshold:    100,
 		BroadcastStormThreshold: 500,
-		SamplingPeriod:          10 * time.Second,
+		PollInterval:            10 * time.Second,
 		DuplicateMACWindow:      2 * time.Second,
-		BPFFilter:               "", // Empty = capture all traffic
+		Targets:                 []SNMPTargetConfig{},
 		LogFile:                 "",
 		JSONOutput:              false,
 		EnableBell:              true,
@@ -50,14 +74,18 @@ func LoadFromFile(path string) (*Config, error) {
 
 	// Custom unmarshaler for duration fields
 	type configAlias struct {
-		PacketCountThreshold    int    `json:"packetCountThreshold"`
-		BroadcastStormThreshold int    `json:"broadcastStormThreshold"`
-		SamplingPeriodSec       int    `json:"samplingPeriodSec"`
-		DuplicateMACWindowSec   int    `json:"duplicateMACWindowSec"`
-		BPFFilter               string `json:"bpfFilter"`
-		LogFile                 string `json:"logFile"`
-		JSONOutput              bool   `json:"jsonOutput"`
-		EnableBell              bool   `json:"enableBell"`
+		PacketCountThreshold    int                `json:"packetCountThreshold"`
+		BroadcastStormThreshold int                `json:"broadcastStormThreshold"`
+		PollIntervalSec         int                `json:"pollIntervalSec"`
+		DuplicateMACWindowSec   int                `json:"duplicateMACWindowSec"`
+		Targets                 []SNMPTargetConfig `json:"targets"`
+		// Legacy fields for backward compatibility
+		SNMPTargets   []string `json:"snmpTargets"`
+		SNMPCommunity string   `json:"snmpCommunity"`
+
+		LogFile    string `json:"logFile"`
+		JSONOutput bool   `json:"jsonOutput"`
+		EnableBell bool   `json:"enableBell"`
 	}
 
 	var raw configAlias
@@ -71,15 +99,31 @@ func LoadFromFile(path string) (*Config, error) {
 	if raw.BroadcastStormThreshold > 0 {
 		cfg.BroadcastStormThreshold = raw.BroadcastStormThreshold
 	}
-	if raw.SamplingPeriodSec > 0 {
-		cfg.SamplingPeriod = time.Duration(raw.SamplingPeriodSec) * time.Second
+	if raw.PollIntervalSec > 0 {
+		cfg.PollInterval = time.Duration(raw.PollIntervalSec) * time.Second
 	}
 	if raw.DuplicateMACWindowSec > 0 {
 		cfg.DuplicateMACWindow = time.Duration(raw.DuplicateMACWindowSec) * time.Second
 	}
-	if raw.BPFFilter != "" {
-		cfg.BPFFilter = raw.BPFFilter
+
+	// Migration legacy config if present
+	if len(raw.Targets) > 0 {
+		cfg.Targets = raw.Targets
+	} else if len(raw.SNMPTargets) > 0 {
+		// Migrate legacy simple config to new struct
+		community := raw.SNMPCommunity
+		if community == "" {
+			community = "public"
+		}
+		for _, target := range raw.SNMPTargets {
+			cfg.Targets = append(cfg.Targets, SNMPTargetConfig{
+				Address:   target,
+				Version:   SNMPVersion2c,
+				Community: community,
+			})
+		}
 	}
+
 	cfg.LogFile = raw.LogFile
 	cfg.JSONOutput = raw.JSONOutput
 	cfg.EnableBell = raw.EnableBell
@@ -90,22 +134,22 @@ func LoadFromFile(path string) (*Config, error) {
 // SaveToFile saves the configuration to a JSON file
 func (c *Config) SaveToFile(path string) error {
 	type configAlias struct {
-		PacketCountThreshold    int    `json:"packetCountThreshold"`
-		BroadcastStormThreshold int    `json:"broadcastStormThreshold"`
-		SamplingPeriodSec       int    `json:"samplingPeriodSec"`
-		DuplicateMACWindowSec   int    `json:"duplicateMACWindowSec"`
-		BPFFilter               string `json:"bpfFilter"`
-		LogFile                 string `json:"logFile"`
-		JSONOutput              bool   `json:"jsonOutput"`
-		EnableBell              bool   `json:"enableBell"`
+		PacketCountThreshold    int                `json:"packetCountThreshold"`
+		BroadcastStormThreshold int                `json:"broadcastStormThreshold"`
+		PollIntervalSec         int                `json:"pollIntervalSec"`
+		DuplicateMACWindowSec   int                `json:"duplicateMACWindowSec"`
+		Targets                 []SNMPTargetConfig `json:"targets"`
+		LogFile                 string             `json:"logFile"`
+		JSONOutput              bool               `json:"jsonOutput"`
+		EnableBell              bool               `json:"enableBell"`
 	}
 
 	raw := configAlias{
 		PacketCountThreshold:    c.PacketCountThreshold,
 		BroadcastStormThreshold: c.BroadcastStormThreshold,
-		SamplingPeriodSec:       int(c.SamplingPeriod.Seconds()),
+		PollIntervalSec:         int(c.PollInterval.Seconds()),
 		DuplicateMACWindowSec:   int(c.DuplicateMACWindow.Seconds()),
-		BPFFilter:               c.BPFFilter,
+		Targets:                 c.Targets,
 		LogFile:                 c.LogFile,
 		JSONOutput:              c.JSONOutput,
 		EnableBell:              c.EnableBell,

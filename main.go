@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -18,11 +17,6 @@ import (
 func main() {
 	// Parse command line flags
 	cfg, useLegacyUI := parseFlags()
-
-	// Check for administrator privileges on Windows
-	if runtime.GOOS == "windows" {
-		checkWindowsAdminRights()
-	}
 
 	// Initialize detector with configuration
 	d, err := detector.NewWithConfig(cfg)
@@ -66,31 +60,32 @@ func runLegacyUI(d *detector.Detector) {
 	}
 }
 
-// parseFlags handles command line argument parsing
+// parseFlags handles command line arguments
 func parseFlags() (*config.Config, bool) {
 	cfg := config.DefaultConfig()
 
 	// Define flags
 	configFile := flag.String("config", "", "Path to configuration file (JSON)")
 	threshold := flag.Int("threshold", 0, "Packet count threshold for loop detection")
-	sampleTime := flag.Int("sample-time", 0, "Sampling period in seconds")
+	pollInterval := flag.Int("poll-interval", 0, "SNMP polling interval in seconds")
 	broadcastThreshold := flag.Int("broadcast-threshold", 0, "Broadcast storm threshold (packets/second)")
 	logFile := flag.String("log", "", "Path to log file for event recording")
 	jsonOutput := flag.Bool("json", false, "Output log in JSON format")
-	bpfFilter := flag.String("filter", "", "Custom BPF filter (e.g., 'ether proto 0x8809')")
 	noBell := flag.Bool("no-bell", false, "Disable terminal bell for alerts")
 	legacyUI := flag.Bool("legacy", false, "Use legacy terminal UI instead of TUI")
 
+	// SNMP specific
+	snmpTargets := flag.String("targets", "", "Comma-separated list of SNMP target IPs")
+	snmpCommunity := flag.String("community", "", "SNMP Community string")
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "SpanScan - Network Loop & STP Issue Detector\n\n")
+		fmt.Fprintf(os.Stderr, "SpanScan - Network Loop & STP Issue Detector (SNMP Mode)\n\n")
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s                                    # Launch beautiful TUI\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --threshold=50 --sample-time=5\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --log=events.log --json\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --legacy                           # Use legacy terminal mode\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --targets=192.168.1.10,192.168.1.11 --community=public\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --config=config.json\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -109,8 +104,8 @@ func parseFlags() (*config.Config, bool) {
 	if *threshold > 0 {
 		cfg.PacketCountThreshold = *threshold
 	}
-	if *sampleTime > 0 {
-		cfg.SamplingPeriod = time.Duration(*sampleTime) * time.Second
+	if *pollInterval > 0 {
+		cfg.PollInterval = time.Duration(*pollInterval) * time.Second
 	}
 	if *broadcastThreshold > 0 {
 		cfg.BroadcastStormThreshold = *broadcastThreshold
@@ -121,11 +116,39 @@ func parseFlags() (*config.Config, bool) {
 	if *jsonOutput {
 		cfg.JSONOutput = true
 	}
-	if *bpfFilter != "" {
-		cfg.BPFFilter = *bpfFilter
-	}
 	if *noBell {
 		cfg.EnableBell = false
+	}
+
+	// If CLI flags are present, they override/append to headers
+	if *snmpTargets != "" {
+		targets := strings.Split(*snmpTargets, ",")
+		community := *snmpCommunity
+		if community == "" {
+			community = "public"
+		}
+
+		// If only using flags, maybe we should clear existing config targets to avoid confusion?
+		// For now, let's just append or replace if empty
+		if len(cfg.Targets) == 0 {
+			for _, t := range targets {
+				cfg.Targets = append(cfg.Targets, config.SNMPTargetConfig{
+					Address:   strings.TrimSpace(t),
+					Version:   config.SNMPVersion2c,
+					Community: community,
+				})
+			}
+		} else {
+			// If we have existing configs, this gets tricky with simple flags.
+			// Let's assume flags add to the session.
+			for _, t := range targets {
+				cfg.Targets = append(cfg.Targets, config.SNMPTargetConfig{
+					Address:   strings.TrimSpace(t),
+					Version:   config.SNMPVersion2c,
+					Community: community,
+				})
+			}
+		}
 	}
 
 	return cfg, *legacyUI
@@ -133,45 +156,5 @@ func parseFlags() (*config.Config, bool) {
 
 // handleInitializationError provides helpful error messages based on the error
 func handleInitializationError(err error) {
-	errorMsg := err.Error()
-
-	if strings.Contains(errorMsg, "no suitable devices found") ||
-		strings.Contains(errorMsg, "finding network devices") {
-		fmt.Println("\nERROR: Unable to find suitable network interfaces.")
-		if runtime.GOOS == "windows" {
-			fmt.Println("\nPossible solutions:")
-			fmt.Println("1. Make sure Npcap or WinPcap is installed:")
-			fmt.Println("   - Npcap: https://nmap.org/npcap/")
-			fmt.Println("   - WinPcap: https://www.winpcap.org/")
-			fmt.Println("2. Run SpanScan as Administrator")
-			fmt.Println("3. Check if your antivirus or security software is blocking access")
-		} else if runtime.GOOS == "linux" {
-			fmt.Println("\nPossible solutions:")
-			fmt.Println("1. Make sure libpcap-dev is installed:")
-			fmt.Println("   sudo apt-get install libpcap-dev")
-			fmt.Println("2. Run SpanScan with sudo privileges:")
-			fmt.Println("   sudo ./spanscan")
-		} else if runtime.GOOS == "darwin" {
-			fmt.Println("\nPossible solutions:")
-			fmt.Println("1. Make sure libpcap is installed:")
-			fmt.Println("   brew install libpcap")
-			fmt.Println("2. Run SpanScan with sudo privileges:")
-			fmt.Println("   sudo ./spanscan")
-		}
-	} else {
-		log.Fatalf("Failed to initialize detector: %v", err)
-	}
-}
-
-// checkWindowsAdminRights checks if running with admin privileges on Windows
-func checkWindowsAdminRights() {
-	// Simple check - try to open a privileged file
-	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-	if err != nil {
-		fmt.Println("WARNING: SpanScan may not be running with Administrator privileges.")
-		fmt.Println("         Some network interfaces may not be accessible.")
-		fmt.Println("         Right-click and select 'Run as administrator' for full functionality.")
-		fmt.Println("")
-		time.Sleep(3 * time.Second)
-	}
+	fmt.Printf("Error initializing detector: %v\n", err)
 }
